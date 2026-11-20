@@ -9,20 +9,30 @@ longest-prefix-match results for every destination address — with "drop"
 and "no-match" kept distinct — both before and after withdrawing the
 failed next-hop from old and new tables.  When the minimum does not fit
 the capacity, only the minimum required entry count is reported.
+
+A second tool audits the swapped-in device: given the configured routes
+(a few of them marked "pending") plus a snapshot of the installed entry
+count and probed destination addresses, it reports for every pending route
+whether it is certainly installed, certainly missing, or undecidable —
+or flags an evidence conflict when no table fits all the facts.
 """
 
 from __future__ import annotations
 
-from ipaddress import IPv4Network, ip_network
-from typing import List, Optional
+from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
+from typing import List, Literal, Optional
 
 from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .compressor import DROP, compress, verify
+from .diagnosis import diagnose
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MAX_ROUTES = 128
+MAX_PENDING = 16
+MAX_OBSERVATIONS = 64
+NO_MATCH = "no-match"
 
 # ---------------------------------------------------------------------------
 # demo payloads (shown in /docs)
@@ -78,6 +88,83 @@ EXAMPLE_FAILOVER_LADDER = {
         ],
         "capacity": 8,
         "failed_nexthop": "NH2",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# /diagnose demo payloads
+# ---------------------------------------------------------------------------
+
+DIAG_DEMO_ROUTES = [
+    {"prefix": "10.0.0.0/8", "action": "NH1", "status": "confirmed"},
+    {"prefix": "10.1.0.0/16", "action": "NH2", "status": "pending"},
+    {"prefix": "10.2.0.0/16", "action": "NH2", "status": "pending"},
+    {"prefix": "10.3.0.0/16", "action": "drop", "status": "pending"},
+    {"prefix": "192.168.0.0/16", "action": "NH3", "status": "confirmed"},
+]
+
+EXAMPLE_DIAG_ALL_DECIDED = {
+    "summary": "换机核查：三条待核查路由全部被判定",
+    "description": (
+        "换机后 5 条配置路由中 3 条待核查，快照显示实装 4 条（即待核查中恰好装了 2 条）。"
+        "观测 10.1.2.3→NH2 说明 10.1.0.0/16 必定在（否则走 /8 回落到 NH1）；"
+        "观测 10.3.2.1→NH1 而非 drop 说明 10.3.0.0/16 必定漏装；"
+        "于是条数约束迫使 10.2.0.0/16 必定在。漏装的只有 10.3.0.0/16，定向补发即可。"
+    ),
+    "value": {
+        "routes": DIAG_DEMO_ROUTES,
+        "snapshot": {
+            "installed_count": 4,
+            "observations": [
+                {"address": "10.1.2.3", "result": "NH2"},
+                {"address": "10.3.2.1", "result": "NH1"},
+                {"address": "192.168.9.9", "result": "NH3"},
+                {"address": "203.0.113.5", "result": "no-match"},
+            ],
+        },
+    },
+}
+
+EXAMPLE_DIAG_UNDETERMINED = {
+    "summary": "只凭条数无法确定：两条待核查路由二选一",
+    "description": (
+        "两条待核查路由去向同为 NH2，快照实装 2 条 = 1 条确认 + 恰好 1 条待核查，"
+        "观测地址只命中确认路由，无法区分装了哪一条：两条都是 undetermined，"
+        "相符的表共 2 张。"
+    ),
+    "value": {
+        "routes": [
+            {"prefix": "10.0.0.0/8", "action": "NH1", "status": "confirmed"},
+            {"prefix": "10.1.0.0/16", "action": "NH2", "status": "pending"},
+            {"prefix": "10.2.0.0/16", "action": "NH2", "status": "pending"},
+        ],
+        "snapshot": {
+            "installed_count": 2,
+            "observations": [
+                {"address": "10.9.9.9", "result": "NH1"},
+            ],
+        },
+    },
+}
+
+EXAMPLE_DIAG_CONFLICT = {
+    "summary": "证据冲突：实装条数与观测不可能同时成立",
+    "description": (
+        "快照称实装 2 条（确认 1 条 + 待核查 1 条全装），"
+        "但观测 10.1.2.3→NH1：若 10.1.0.0/16 已装，最长匹配应得 NH2。"
+        "没有任何符合模型的表能同时满足全部证据，只回报 conflict，不给逐条结论。"
+    ),
+    "value": {
+        "routes": [
+            {"prefix": "10.0.0.0/8", "action": "NH1", "status": "confirmed"},
+            {"prefix": "10.1.0.0/16", "action": "NH2", "status": "pending"},
+        ],
+        "snapshot": {
+            "installed_count": 2,
+            "observations": [
+                {"address": "10.1.2.3", "result": "NH1"},
+            ],
+        },
     },
 }
 
@@ -187,6 +274,124 @@ class VerifyResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# /diagnose schemas
+# ---------------------------------------------------------------------------
+
+class DiagRoute(Route):
+    """A configured route whose installation state is confirmed or pending."""
+
+    status: Literal["confirmed", "pending"] = Field(
+        default="confirmed",
+        description=(
+            "'confirmed' entries are certainly installed; 'pending' entries "
+            f"(at most {MAX_PENDING}) are the only ones the actual table may lack."
+        ),
+    )
+
+    @field_validator("action")
+    @classmethod
+    def _action_not_reserved(cls, v: str) -> str:
+        if v == NO_MATCH:
+            raise ValueError(f"action {NO_MATCH!r} is reserved for observations")
+        return v
+
+
+class Observation(BaseModel):
+    """One probe: the forwarding result observed for a destination address."""
+
+    address: str = Field(examples=["10.1.2.3"])
+    result: str = Field(
+        min_length=1,
+        max_length=64,
+        examples=["NH2"],
+        description=(
+            "Observed next-hop name, 'drop', or 'no-match' when no installed "
+            "route covers the address."
+        ),
+    )
+
+    @field_validator("address")
+    @classmethod
+    def _check_address(cls, v: str) -> str:
+        try:
+            addr = ip_address(v.strip())
+        except ValueError as exc:
+            raise ValueError(f"invalid IPv4 address: {v!r}") from exc
+        if not isinstance(addr, IPv4Address):
+            raise ValueError(f"not an IPv4 address: {v!r}")
+        return str(addr)
+
+    @field_validator("result")
+    @classmethod
+    def _check_result(cls, v: str) -> str:
+        r = v.strip()
+        if not r:
+            raise ValueError("result must be a next-hop name, 'drop', or 'no-match'")
+        return r
+
+
+class Snapshot(BaseModel):
+    """Evidence collected from the device being diagnosed."""
+
+    installed_count: int = Field(
+        ge=0,
+        le=MAX_ROUTES,
+        description="Number of entries actually installed on the device.",
+    )
+    observations: List[Observation] = Field(
+        default=[],
+        max_length=MAX_OBSERVATIONS,
+        description=f"Up to {MAX_OBSERVATIONS} probed destination addresses.",
+    )
+
+
+class DiagnoseRequest(BaseModel):
+    routes: List[DiagRoute] = Field(
+        max_length=MAX_ROUTES,
+        description=(
+            f"Up to {MAX_ROUTES} configured routes with distinct prefixes; "
+            f"at most {MAX_PENDING} may be marked 'pending'."
+        ),
+    )
+    snapshot: Snapshot
+
+    @model_validator(mode="after")
+    def _check_routes(self):
+        prefixes = [r.prefix for r in self.routes]
+        if len(set(prefixes)) != len(prefixes):
+            raise ValueError("route prefixes must be distinct")
+        pending = sum(1 for r in self.routes if r.status == "pending")
+        if pending > MAX_PENDING:
+            raise ValueError(f"at most {MAX_PENDING} routes may be pending")
+        return self
+
+
+class PendingVerdict(BaseModel):
+    prefix: str
+    action: str
+    verdict: Literal["must_be_present", "must_be_missing", "undetermined"] = Field(
+        description=(
+            "must_be_present: installed in every consistent table; "
+            "must_be_missing: absent from every consistent table "
+            "(re-issue this route); undetermined: the evidence cannot decide."
+        )
+    )
+
+
+class DiagnoseResponse(BaseModel):
+    status: str = Field(description="'ok' or 'conflict'.")
+    consistent_tables: int = Field(
+        description="How many actual tables agree with all the evidence (0 on conflict)."
+    )
+    verdicts: Optional[List[PendingVerdict]] = Field(
+        description="Per pending-route verdicts; null on evidence conflict."
+    )
+    detail: Optional[str] = Field(
+        description="Human-readable explanation, set on evidence conflict."
+    )
+
+
+# ---------------------------------------------------------------------------
 # application
 # ---------------------------------------------------------------------------
 
@@ -199,7 +404,12 @@ app = FastAPI(
         "longest-prefix matching — distinguishing drop from no-match — both "
         "before and after a next-hop failure drill. "
         "Try the ready-made examples below: one where the capacity suffices "
-        "and one where only the minimum required count is reported."
+        "and one where only the minimum required count is reported.\n\n"
+        "POST /diagnose audits a freshly swapped device: given the configured "
+        "routes (a few marked pending) plus a snapshot of the installed entry "
+        "count and probed destinations, it reports which pending routes are "
+        "certainly installed, certainly missing, or undecidable — or flags an "
+        "evidence conflict."
     ),
 )
 
@@ -212,10 +422,16 @@ def root():
         "endpoints": {
             "POST /compress": "minimal equivalent table (or minimum count when over capacity)",
             "POST /verify": "check two tables for normal + failover equivalence",
+            "POST /diagnose": "audit which pending routes the device actually installed",
             "GET /docs": "interactive demo",
         },
-        "limits": {"max_routes": MAX_ROUTES},
+        "limits": {
+            "max_routes": MAX_ROUTES,
+            "max_pending_routes": MAX_PENDING,
+            "max_observations": MAX_OBSERVATIONS,
+        },
         "reserved_action": DROP,
+        "reserved_observation_result": NO_MATCH,
     }
 
 
@@ -268,3 +484,48 @@ def verify_endpoint(req: VerifyRequest):
     new = [(IPv4Network(r.prefix), r.action) for r in req.new_routes]
     ok, detail = verify(old, new, req.failed_nexthop)
     return VerifyResponse(equivalent=ok, **detail)
+
+
+@app.post("/diagnose", response_model=DiagnoseResponse, summary="Diagnose missing routes")
+def diagnose_endpoint(
+    req: DiagnoseRequest = Body(
+        openapi_examples={
+            "all_decided": EXAMPLE_DIAG_ALL_DECIDED,
+            "undetermined": EXAMPLE_DIAG_UNDETERMINED,
+            "evidence_conflict": EXAMPLE_DIAG_CONFLICT,
+        }
+    )
+):
+    routes = [
+        (IPv4Network(r.prefix), r.action, r.status == "pending") for r in req.routes
+    ]
+    observations = [
+        (IPv4Address(o.address), None if o.result == NO_MATCH else o.result)
+        for o in req.snapshot.observations
+    ]
+    verdicts, consistent = diagnose(
+        routes, req.snapshot.installed_count, observations
+    )
+
+    if verdicts is None:
+        return DiagnoseResponse(
+            status="conflict",
+            consistent_tables=0,
+            verdicts=None,
+            detail=(
+                "证据冲突：实装条数与全部观测无法同时成立——"
+                "不存在一张与证据相符的转发表（确认路由全装、"
+                "待核查路由任选、条目总数与每次观测的最长前缀匹配结果一致）。"
+            ),
+        )
+
+    pending_routes = [r for r in req.routes if r.status == "pending"]
+    return DiagnoseResponse(
+        status="ok",
+        consistent_tables=consistent,
+        verdicts=[
+            PendingVerdict(prefix=r.prefix, action=r.action, verdict=v)
+            for r, v in zip(pending_routes, verdicts)
+        ],
+        detail=None,
+    )
